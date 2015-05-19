@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+from collections import namedtuple
+
+optparser = optparse.OptionParser()
+optparser.add_option("-i", "--input", dest="input", default="data/input", help="File containing sentences to translate (default=data/input)")
+optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm", help="File containing translation model (default=data/tm)")
+optparser.add_option("-l", "--language-model", dest="lm", default="data/lm", help="File containing ARPA-format language model (default=data/lm)")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxint, type="int", help="Number of sentences to decode (default=no limit)")
+optparser.add_option("-k", "--translations-per-phrase", dest="k", default=1, type="int", help="Limit on number of translations to consider per phrase (default=1)")
+optparser.add_option("-s", "--stack-size", dest="s", default=1, type="int", help="Maximum stack size (default=1)")
+optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
+opts = optparser.parse_args()[0]
+
+# TM contains tuples of words
+tm = models.TM(opts.tm, opts.k)
+lm = models.LM(opts.lm)
+french = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+
+def extract_english(h):
+    return "" if h.predecessor is None else "%s%s " % (extract_english(h.predecessor), h.phrase.english)
+
+def get_future_cost_table(french_sentence):
+    future_cost = [{} for _ in range(len(french_sentence))]
+
+    # for every possible range of words within french_sentence
+    for length in range(1, len(french_sentence) + 1):
+        for start in range(1, len(french_sentence) - length + 1):
+            end = start + length
+
+            # if the translation cost exists for the given range of words within french_sentence
+            # then compute future_cost, else set to negative infinity
+            future_cost[start][end] = float('-inf')
+            if french_sentence[start:end] in tm:
+                phrase = tm[french_sentence[start:end]][0]
+                logprob = phrase.logprob
+                lm_state = lm.begin()
+                for word in phrase.english.split():
+                    (lm_state, word_logprob) = lm.score(lm_state, word)
+                    logprob += word_logprob
+                future_cost[start][end] = logprob
+
+            # update cost
+            for i in range(start + 1, end):
+                if i in future_cost[start] and i in future_cost:
+                    future_cost[start][end] = max(future_cost[start][i] + future_cost[i][end], future_cost[start][end])
+
+    return future_cost
+
+def get_bitmap_vector(sequence):
+    bitmap = 0
+    for num in sequence:
+        num_bitmap = 1 << num
+        bitmap = bitmap | num_bitmap
+    return bitmap
+
+def get_bitmap_string(bitmap):
+    output = ''
+    while bitmap > 0:
+        if bitmap & 1 == 1:
+            output = output + '1'
+        else:
+            output = output + '0'
+        bitmap = bitmap >> 1
+    return output
+
+# tm should translate unknown words as-is with probability 1
+for word in set(sum(french,())):
+    if (word,) not in tm:
+        tm[(word,)] = [models.phrase(word, 0.0)]
+
+sys.stderr.write("Decoding %s...\n" % (opts.input,))
+for french_sentence in french:
+
+    sentence_length = len(french_sentence)
+
+    # create named tuple so its easier to deal with the values we are working on
+    hypothesis = namedtuple("hypothesis", "logprob, lm_state, predecessor, phrase, cost, span, coverage_vector")
+    initial_hypothesis = hypothesis(0.0, lm.begin(), None, None, 0.0, 0, 0)
+
+    # initialize an array of dictionaries of size N+1 (where N is the number of tokens)
+    stacks = [{} for _ in french_sentence] + [{}]
+
+    # add a sentence start token as the initial hypothesis to start with
+    stacks[0][0] = initial_hypothesis
+
+    # future cost table
+    future_cost_table = get_future_cost_table(french_sentence)
+
+    # loop through all but the last stack in the array of stacks (so for each word)
+    for stack in stacks[:-1]:
+        sorted_stack = sorted(stack.itervalues(),key=lambda h: -h.cost)[:opts.s]
+        # loop through stack dictionary contents, starting with the values with the lowest COST
+        for num, current_hypothesis in enumerate(sorted_stack):
+            # loop through all uncovered/untranslated intervals within the french_sentence
+            for i in range(sentence_length):
+                for j in range(i, sentence_length + 1):
+
+                    # if the current range of words exists in our translation model
+                    if french_sentence[i:j] in tm:
+
+                        # if the current range of words is an uncovered interval
+                        bit_vector = get_bitmap_vector(range(i,j))
+                        is_covered = current_hypothesis.coverage_vector & bit_vector
+                        if is_covered == 0:
+                            for phrase in tm[french_sentence[i:j]]:
+
+                                # get future cost estimate for the current hypothesis
+                                coverage_vector = current_hypothesis.coverage_vector | bit_vector
+                                #future_cost = get_future_cost_estimate(coverage_vector, sentence_length, future_cost_table)
+                                cost_start = 1
+                                future_cost = 0
+                                bit_vector_string = get_bitmap_string(coverage_vector)
+                                for index, bit in enumerate(bit_vector_string):
+                                    if bit == '1':
+                                        if index > cost_start and bit_vector_string[index - 1] == '0':
+                                            future_cost += future_cost_table[cost_start][index]
+                                        cost_start = index + 1
+
+                                # add the logprob for this phrase to the logprob of the current hypothesis
+                                logprob = current_hypothesis.logprob + phrase.logprob
+
+                                # extract the current state of the language model
+                                current_lm_state = current_hypothesis.lm_state
+
+                                # find the log prob of each word in the phrase, given the current language models state
+                                # then add the logprob into the logprob tally for this phrase
+                                for word in phrase.english.split():
+                                    (current_lm_state, word_logprob) = lm.score(current_lm_state, word)
+                                    logprob += word_logprob
+
+                                # add the log prob that this is the end of the sentence (once we hit the end)
+                                logprob += lm.end(current_lm_state) if current_hypothesis.span + j - i == sentence_length else 0.0
+
+                                # create a new hypothesis value given the current set of data
+                                new_future_cost = logprob + future_cost
+                                new_hypothesis = hypothesis(logprob, current_lm_state, current_hypothesis, phrase, new_future_cost, length, coverage_vector)
+
+                                # add it to the current stack for the state if that state's stack is empty, or if the log prob is lower
+                                if coverage_vector not in stacks[length] or stacks[length][coverage_vector].logprob < logprob:
+                                    stacks[length][coverage_vector] = new_hypothesis
+
+    # take the lowest absolute log prob value as our winnar
+    winner = max(stacks[-1].itervalues(), key=lambda h: h.logprob)
+
+    print extract_english(winner)
+
+    # such verbose
+    if opts.verbose:
+        def extract_tm_logprob(h):
+            return 0.0 if h.predecessor is None else h.phrase.logprob + extract_tm_logprob(h.predecessor)
+        tm_logprob = extract_tm_logprob(winner)
+        sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % (winner.logprob - tm_logprob, tm_logprob, winner.logprob))
